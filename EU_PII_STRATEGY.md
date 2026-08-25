@@ -59,6 +59,40 @@ The strongest path = a **small bidirectional encoder on the LFM architecture**, 
 ### The EU PII data challenge
 The critical bottleneck is **multilingual EU-resistant PII training data** — the entire model quality rests on it.
 
+### VERIFIED: ai4privacy/pii-masking-openpii-1m (checked hands-on 2026-08-25)
+
+**License: CC-BY-4.0 — commercial use permitted with attribution.** This unblocks the
+commercial API plan; no enterprise negotiation needed. (Synthetic PII only — no real
+personal data, GDPR-safe to train on.)
+
+Hands-on verification results:
+- **1,428,143 examples** (1,143,397 train / 284,746 validation), train.jsonl = 3.69 GB.
+- **23 EU languages**, 29 regions; verified blocks: bg, da, en, et, hr, lv — coherent
+  in-language text with locale-correct formats.
+- **Offset integrity: 5220/5220 spans exact** (`text[start:end] == value`) — no alignment bugs.
+- **10.3M annotations**, 19 identity-centric labels: DATE, GIVENNAME, SURNAME, EMAIL, CITY,
+  TITLE, TELEPHONENUM, AGE, STREET, BUILDINGNUM, ZIPCODE, IDCARDNUM, CREDITCARDNUMBER,
+  DRIVERLICENSENUM, GENDER, TAXNUM, SEX, SOCIALNUM, PASSPORTNUM.
+- Rows carry `language`, `region`, `script`, `uid`, pre-computed mBERT BIO labels.
+
+**Taxonomy gap vs LiquidAI's 40 types** (what openpii-1m does NOT cover):
+IBAN/BIC/bank accounts, credentials (API keys, passwords, JWT), org/company_name,
+IP/MAC addresses, GPS, medical (PHI). → Fill with: our own `pii_generator_full.py`
+(covers company_name + structural types) and/or ai4privacy extended sets (82+ labels,
+enterprise inquiry) and GDPR-relevant validators (IBAN checksum = pure rule layer anyway).
+
+**Scale check:** we previously trained on ~6k rows and hit a data-volume-limited ceiling
+(~0.72 exact F1). This is **190x more data** (1.14M rows) across 23 EU languages. The OPF
+paper shows ~500 examples already beats a 1.5B zero-shot model — at 1M+ examples the
+data-volume argument is over; remaining quality comes from architecture, per-locale
+balance, validators, and decode. This dataset removes the #1 risk in the strategy.
+
+**Next concrete step:** download full file (3.7GB) to the training server, filter/shard
+EU-language subset, convert to our token-classification format, keep `language`/`region`
+tags for per-locale eval.
+
+---
+
 ### Recommended data stack (all accessible)
 
 | Corpus | Why it matters | Access |
