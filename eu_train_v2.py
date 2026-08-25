@@ -102,7 +102,31 @@ def bioes_decode(logits, offsets, lmap_rev, text):
             out.append({"start": s, "end": e, "type": t})
     return out
 
+def save_verify(model, lmap, path, tok, lmap_rev, verify_rows, dev):
+    """Atomic save + fast verify: reload saved tensors into the SAME model."""
+    import os, hashlib
+    sd = {"model": model.state_dict(), "labels": lmap}
+    tmp = path + ".tmp"
+    torch.save(sd, tmp)
+    os.replace(tmp, path)
+    sd_disk = torch.load(path, map_location="cpu", weights_only=False)["model"]
+    model.load_state_dict(sd_disk, strict=True)
+    model.to(dev).eval()
+    preds = []
+    with torch.no_grad():
+        enc = tok([r["text"] for r in verify_rows], padding=True, truncation=True,
+                  max_length=512, return_offsets_mapping=True, return_tensors="pt")
+        off = enc.pop("offset_mapping")
+        lg = model(enc["input_ids"].to(dev), attention_mask=enc["attention_mask"].to(dev)).logits.argmax(-1).cpu()
+        for j, r in enumerate(verify_rows):
+            offs = [(int(a), int(b)) for a, b in off[j].tolist()]
+            preds.append(bioes_decode(lg[j].tolist(), offs, lmap_rev, r["text"]))
+    f1d, f1e = span_metrics(preds, verify_rows)
+    H = hashlib.md5(open(path, "rb").read()[:1 << 20]).hexdigest()[:8]
+    return f1d, f1e, H
+
 def span_metrics(preds, rows):
+    """Strict exact-span detection F1 + exact-type F1 aggregated."""
     """Strict exact-span detection F1 + exact-type F1 aggregated."""
     det = [0,0,0]; ext = [0,0,0]
     for p, r in zip(preds, rows):
@@ -152,6 +176,9 @@ def main():
     ap.add_argument("--eval-rows", type=int, default=2000)
     ap.add_argument("--val-min-f1", type=float, default=0.0)
     ap.add_argument("--save", default="/scratch/pii_corpus/eurobert_pii_v2.pt")
+    ap.add_argument("--init-from", default="", help="load weights from a checkpoint before training")
+    ap.add_argument("--use-wandb", action="store_true")
+    ap.add_argument("--run-name", default="eurobert-pii-eu-v2")
     args = ap.parse_args()
 
     torch.manual_seed(0); random.seed(0)
@@ -180,9 +207,27 @@ def main():
 
     from transformers import AutoModelForTokenClassification
     model = AutoModelForTokenClassification.from_pretrained(args.model, trust_remote_code=True, num_labels=len(lmap))
+    if args.init_from:
+        _sd = torch.load(args.init_from, map_location="cpu", weights_only=False)["model"]
+        model.load_state_dict(_sd, strict=True)
+        print(f"init-from: loaded {args.init_from}", flush=True)
     dev = "cuda"
     model.to(dev)
     print("params:", round(sum(p.numel() for p in model.parameters())/1e6, 1), "M", flush=True)
+
+    wb = None
+    if args.use_wandb:
+        try:
+            import wandb
+            wandb.login(key=open("/root/.wandb_key").read().strip())
+            wandb.init(project="eurobert-pii", name=args.run_name,
+                       config={"params": sum(p.numel() for p in model.parameters()), "labels": len(lmap),
+                               "lr": args.lr, "batch": args.batch, "seq": args.seq,
+                               "train_rows": len(tr), "scheme": "BIOES", "boundary_weight": 3.0})
+            wb = wandb
+            print(f"wandb tracking run '{args.run_name}'", flush=True)
+        except Exception as e:
+            print("wandb skip:", e, flush=True)
 
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
     dl = DataLoader(RowsDS(tr), batch_size=args.batch, shuffle=True,
@@ -237,12 +282,19 @@ def main():
                 model.train()
                 marker = ""
                 if f1_det > best_f1 + 1e-4:
+                    # persist + verify disk round-trip ON THE SAME ROWS just measured
                     best_f1, bad_evals = f1_det, 0
-                    torch.save({"model": model.state_dict(), "labels": lmap}, args.save)
-                    marker = " *BEST"
+                    vd, ve, H = save_verify(model, lmap, args.save, tok, lm_rev, gold_rows, dev)
+                    marker = f" *BEST saved detF1={vd:.4f} sha={H}"
+                    if abs(vd - f1_det) > 0.02:
+                        raise RuntimeError(f"save-verify divergence: in-mem {f1_det} vs disk {vd}")
                 else:
                     bad_evals += 1
                 print(f"ep{ep} step{step} loss={tot/max(1,nb):.4f} detF1={f1_det:.4f} exactF1={f1_ext:.4f} bestDetF1={best_f1:.4f}{marker}", flush=True)
+                if wb:
+                    wb.log({"step": step, "epoch": ep, "loss": round(tot / max(1, nb), 4),
+                            "det_F1": round(f1_det, 4), "exact_F1": round(f1_ext, 4),
+                            "best_det_F1": round(best_f1, 4), "lr": float(opt.param_groups[0]["lr"])})
                 tot, nb = 0.0, 0
                 if bad_evals >= patience_evals and step > 8000:
                     print("early stop", flush=True)
