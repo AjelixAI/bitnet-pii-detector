@@ -136,6 +136,7 @@ def main():
 
     model = AutoModelForTokenClassification.from_pretrained(
         args.model, trust_remote_code=True, num_labels=len(LABEL_NAMES))
+    model = model.float()  # fp32 weights — required for GradScaler
     model.config.id2label = {i: l for i, l in enumerate(LABEL_NAMES)}
     model.config.label2id = {l: i for i, l in enumerate(LABEL_NAMES)}
     dev = "cuda"; model.to(dev)
@@ -159,6 +160,7 @@ def main():
 
     best_loss, step = 1e9, 0
     t0 = time.time()
+    scaler = torch.amp.GradScaler('cuda')
     for ep in range(args.epochs):
         model.train()
         for ids, attn, labs in dl:
@@ -168,9 +170,13 @@ def main():
                 out = model(input_ids=ids, attention_mask=attn, labels=None)
                 loss = F.cross_entropy(out.logits.view(-1, out.logits.shape[-1]),
                                        labs.view(-1), ignore_index=-100)
-            opt.zero_grad(set_to_none=True); loss.backward()
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); step += 1
+            scaler.step(opt)
+            scaler.update()
+            step += 1
             if step % args.eval_every == 0:
                 model.eval()
                 vt = vn = 0
