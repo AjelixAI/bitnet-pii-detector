@@ -106,6 +106,8 @@ def main():
     ap.add_argument("--save", default="/scratch/pii_corpus/piiranha_rep.pt")
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--acc-steps", type=int, default=1)
+    ap.add_argument("--use-wandb", action="store_true")
+    ap.add_argument("--run-name", default="piiranha-replication")
     args = ap.parse_args()
 
     torch.manual_seed(42)
@@ -113,7 +115,7 @@ def main():
     ds = load_from_disk(args.data)
     print(f"train: {len(ds['train'])} val: {len(ds['validation'])}", flush=True)
 
-    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, fix_mistral_regex=True)
     print(f"tokenizer: {type(tok).__name__} | vocab {len(tok)}", flush=True)
 
     def convert(split):
@@ -136,11 +138,25 @@ def main():
 
     model = AutoModelForTokenClassification.from_pretrained(
         args.model, trust_remote_code=True, num_labels=len(LABEL_NAMES))
-    model = model.float()  # fp32 weights — required for GradScaler
+    model = model.float()  # fp32 — pure fp32 training
     model.config.id2label = {i: l for i, l in enumerate(LABEL_NAMES)}
     model.config.label2id = {l: i for i, l in enumerate(LABEL_NAMES)}
     dev = "cuda"; model.to(dev)
     print(f"params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M | labels: {len(LABEL_NAMES)}", flush=True)
+
+    wb = None
+    if args.use_wandb:
+        try:
+            import wandb
+            wandb.login(key=open("/root/.wandb_key").read().strip())
+            wb = wandb
+            wandb.init(project="eurobert-pii", name=args.run_name,
+                       config={"base": "mdeberta-v3-base", "data": "pii-masking-400k",
+                               "labels": len(LABEL_NAMES), "lr": args.lr, "batch": args.batch,
+                               "epochs": args.epochs, "seq": args.seq, "train_rows": len(tr)})
+            print(f"wandb: {args.run_name}", flush=True)
+        except Exception as e:
+            print(f"wandb skip: {e}", flush=True)
 
     dl = DataLoader(PIIDataset(tr, tok, args.seq), batch_size=args.batch, shuffle=True,
                     collate_fn=lambda b: collate(b, tok, args.seq))
@@ -160,22 +176,19 @@ def main():
 
     best_loss, step = 1e9, 0
     t0 = time.time()
-    scaler = torch.amp.GradScaler('cuda')
+
     for ep in range(args.epochs):
         model.train()
         for ids, attn, labs in dl:
             ids, attn, labs = ids.to(dev), attn.to(dev), labs.to(dev)
             for g in opt.param_groups: g["lr"] = lr_at(step)
-            with torch.autocast("cuda", dtype=torch.float16):
-                out = model(input_ids=ids, attention_mask=attn, labels=None)
-                loss = F.cross_entropy(out.logits.view(-1, out.logits.shape[-1]),
-                                       labs.view(-1), ignore_index=-100)
+            out = model(input_ids=ids, attention_mask=attn, labels=None)
+            loss = F.cross_entropy(out.logits.view(-1, out.logits.shape[-1]),
+                                   labs.view(-1), ignore_index=-100)
             opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             step += 1
             if step % args.eval_every == 0:
                 model.eval()
@@ -183,10 +196,9 @@ def main():
                 with torch.no_grad():
                     for ids, attn, labs in va_dl:
                         ids, attn, labs = ids.to(dev), attn.to(dev), labs.to(dev)
-                        with torch.autocast("cuda", dtype=torch.float16):
-                            out = model(input_ids=ids, attention_mask=attn, labels=None)
-                            vl = F.cross_entropy(out.logits.view(-1, out.logits.shape[-1]),
-                                                 labs.view(-1), ignore_index=-100)
+                        out = model(input_ids=ids, attention_mask=attn, labels=None)
+                        vl = F.cross_entropy(out.logits.view(-1, out.logits.shape[-1]),
+                                             labs.view(-1), ignore_index=-100)
                         vt += vl.item(); vn += 1
                 val = vt / max(1, vn)
                 model.train()
@@ -196,6 +208,10 @@ def main():
                     torch.save({"model": model.state_dict(), "label_names": LABEL_NAMES}, args.save)
                     marker = " *BEST"
                 print(f"ep{ep+1} step{step} loss={loss.item():.4f} val={val:.4f}{marker}", flush=True)
+                if wb:
+                    wb.log({"step": step, "epoch": ep+1, "loss": round(loss.item(), 4),
+                            "val": round(val, 4), "best_val": round(best_loss, 4),
+                            "lr": float(opt.param_groups[0]["lr"])})
         print(f"epoch {ep+1} done {(time.time()-t0)/60:.0f}min", flush=True)
     print(f"BEST val loss {best_loss:.4f} -> {args.save}", flush=True)
 
