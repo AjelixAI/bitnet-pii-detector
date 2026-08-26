@@ -105,7 +105,7 @@ def main():
     ap.add_argument("--warmup", type=float, default=0.05)
     ap.add_argument("--save", default="/scratch/pii_corpus/piiranha_rep.pt")
     ap.add_argument("--eval-every", type=int, default=500)
-    ap.add_argument("--acc-steps", type=int, default=1)
+    ap.add_argument("--acc-steps", type=int, default=4, help="gradient accumulation; batch*acc = effective batch (Piiranha used 128)")
     ap.add_argument("--use-wandb", action="store_true")
     ap.add_argument("--run-name", default="piiranha-replication")
     args = ap.parse_args()
@@ -127,8 +127,8 @@ def main():
                 lab = sm.get("label", "")
                 if lab not in PII_TYPES: continue
                 spans.append({"start": sm["start"], "end": sm["end"], "type": lab})
-            if text and spans:
-                rows.append({"text": text, "spans": spans})
+            if text:
+                rows.append({"text": text, "spans": spans})  # keep zero-PII rows as negatives
         return rows
 
     print("Converting dataset...", flush=True)
@@ -170,7 +170,7 @@ def main():
     opt = torch.optim.Adam([{"params": decay, "weight_decay": 0.01},
                             {"params": nodecay, "weight_decay": 0.0}],
                            lr=args.lr, betas=(0.9, 0.999), eps=1e-8)
-    steps = len(dl) * args.epochs
+    steps = (len(dl) // args.acc_steps) * args.epochs
     wu = int(args.warmup * steps)
     def lr_at(s): return args.lr * s / max(1, wu) if s < wu else args.lr * (1 - (s - wu) / max(1, steps - wu))
 
@@ -179,18 +179,21 @@ def main():
 
     for ep in range(args.epochs):
         model.train()
-        for ids, attn, labs in dl:
+        opt.zero_grad(set_to_none=True)
+        for bi, (ids, attn, labs) in enumerate(dl):
             ids, attn, labs = ids.to(dev), attn.to(dev), labs.to(dev)
             for g in opt.param_groups: g["lr"] = lr_at(step)
             out = model(input_ids=ids, attention_mask=attn, labels=None)
             loss = F.cross_entropy(out.logits.view(-1, out.logits.shape[-1]),
                                    labs.view(-1), ignore_index=-100)
-            opt.zero_grad(set_to_none=True)
+            loss = loss / args.acc_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            step += 1
-            if step % args.eval_every == 0:
+            if (bi + 1) % args.acc_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                step += 1
+            if (bi + 1) % (args.acc_steps * args.eval_every) == 0:
                 model.eval()
                 vt = vn = 0
                 with torch.no_grad():
@@ -207,7 +210,7 @@ def main():
                     best_loss = val
                     torch.save({"model": model.state_dict(), "label_names": LABEL_NAMES}, args.save)
                     marker = " *BEST"
-                print(f"ep{ep+1} step{step} loss={loss.item():.4f} val={val:.4f}{marker}", flush=True)
+                print(f"ep{ep+1} step{step} loss={loss.item()*args.acc_steps:.4f} val={val:.4f}{marker}", flush=True)
                 if wb:
                     wb.log({"step": step, "epoch": ep+1, "loss": round(loss.item(), 4),
                             "val": round(val, 4), "best_val": round(best_loss, 4),
