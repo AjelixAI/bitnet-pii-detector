@@ -169,6 +169,29 @@ Notes: LFM2-PII evaluated without its hybrid validator post-pass (its *deployed*
 English-first — per-language it scores 0.31–0.37 on DE/FR/IT/ES/NL vs **0.80+ for this model**. The exact-char gap
 vs. token-run F1 is ±1–2 char boundary noise from tokenizer offsets, not missed detections (overlap recall 0.989).
 
+### Cross-domain (PIIBench) — the honest reality check
+
+Evaluated on **[PIIBench](https://github.com/pritesh-2711/pii-bench)** (the unified 10-source corpus from
+[arXiv:2604.15776](https://arxiv.org/abs/2604.15776)): 100,002 held-out test sequences from 10 domains
+(synthetic PII, Wikipedia NER, news, finance) spanning 48 canonical entity types.
+
+| Setting | Span F1 |
+|---|---|
+| **This model, zero-shot on PIIBench test** | **0.0322** (P 0.021 / R 0.066) |
+| PIIBench paper best system (Presidio, rule-based) | 0.1385 |
+| PIIBench paper worst system | < 0.01 |
+| **This model, in-distribution (ai4privacy val)** | **0.9633** |
+
+**This gap is the entire point of PIIBench.** A model that is near-perfect on its training domain fails to
+generalize to real-world domains — well below even a rule-based system. The in-distribution results above
+should **not** be extrapolated to production text without re-validating.
+
+Evaluation method: official PIIBench pipeline (all 10 sources, BIO-normalized); gold spans extracted with
+BERT-offset projection; seqeval token-run F1, type-agnostic; 106,395 gold spans evaluated (~43% of test rows
+alignable to the reference token grid; remainder excluded — not selective). Per-source: few_nerd 0.159,
+conll2003 0.151, multinerd 0.130, isotonic 0.109, wikiann 0.062, ai4privacy_400k 0.058, others ≤ 0.02.
+Reproduce: `eval_piibench_v2.py` (in this repo) + `pii-bench/data/test.jsonl`.
+
 ## How to Use
 
 ```python
@@ -208,9 +231,13 @@ print(spans)
 
 ## Limitations
 
-- **In-distribution**: trained on synthetically generated ai4privacy data; real-world / cross-domain generalization
-  (e.g., legal or medical corpora) should be validated against benchmarks like
-  [PIIBench](https://arxiv.org/abs/2604.15776) or [REDACT](https://arxiv.org/html/2606.19881v1) before production use.
+- **In-distribution limitation (measured)**: trained on synthetically generated ai4privacy data.
+  Zero-shot cross-domain span F1 on [PIIBench](https://arxiv.org/abs/2604.15776) test is **0.0322** —
+  *below* the rule-based Presidio baseline (0.1385) and far below the 0.9633 in-distribution result.
+  Do **not** assume production-quality detection on real-world text without fine-tuning on in-domain data
+  and re-validating against [PIIBench](https://github.com/pritesh-2711/pii-bench) or
+  [REDACT](https://arxiv.org/html/2606.19881v1). The companion study
+  [arXiv:2605.25816](https://arxiv.org/abs/2605.25816) shows fine-tuning on PIIBench train closes this gap.
 - **Taxonomy**: covers the 17 ai4privacy entity types only — out-of-taxonomy identifiers (e.g., Spanish DNI, IBAN,
   licence plates) are *not* labeled by this model and may be misrouted to the closest type.
 - **Languages**: EN, DE, FR, IT, ES, NL. Other EU official languages are not covered in this release.
@@ -231,6 +258,7 @@ print(spans)
 - He, Liu, Gao & Chen (2020). *DeBERTa: Decoding-enhanced BERT with Disentangled Attention.* arXiv:[2006.03654](https://arxiv.org/abs/2006.03654)
 - *Pii Detection* (2025). arXiv:[2510.02055](https://arxiv.org/abs/2510.02055) — the Piiranha recipe this model reproduces
 - *PIIBench: A Unified Multi-Source Benchmark Corpus for Personally Identifiable Information Detection* (2026). arXiv:[2604.15776](https://arxiv.org/abs/2604.15776)
+- *Fine-Tuning Over Architectural Complexity: PII Detection on PIIBench with DeBERTa* (2026). arXiv:[2605.25816](https://arxiv.org/abs/2605.25816)
 - *REDACT: A Systematically Controlled Multilingual Benchmark for Personal Information Detection* (2026). arXiv:[2606.19881](https://arxiv.org/html/2606.19881v1)
 - LiquidAI (2025). *LFM2-PII: Contextual PII Detection with Hybrid Context-Cued Decoding.* [model card](https://huggingface.co/LiquidAI/lfm_pii_detector)
 - Microsoft (2022–). *Presidio: Context-aware, pluggable and customizable PII anonymization service.* [GitHub](https://github.com/microsoft/presidio)
