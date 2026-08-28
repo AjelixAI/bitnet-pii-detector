@@ -53,3 +53,22 @@ EuroBERT-610m is best on all 5 EU languages (+0.065 macro over DeBERTa-base, +0.
 Note: exact token-run F1 is lower for EuroBERT (0.172 vs DeBERTa 0.255) due to tokenizer boundary
 differences on the mBERT grid; overlap is the correct cross-system detection metric.
 Reproduce: `eval_eu_multilingual.py [max_rows_per_lang]` on the PIIBench server.
+
+## Nervaluate benchmark on hivetrace/pii-bench (Russian multi-domain, 900 docs)
+Type-agnostic span detection (all->ENT), nervaluate strict/partial, whitespace-trimmed spans.
+All neural systems zero-shot (trained on English/EU PIIBench; no Russian training).
+
+| System | strict-F1 | P | R | partial-F1 |
+|---|---|---|---|---|
+| Presidio (regex) | **0.3545** | 0.246 | 0.637 | 0.3987 |
+| DeBERTa-base (authors) | 0.2893 | 0.208 | 0.476 | **0.4359** |
+| EuroBERT-610m (ours) | 0.0698 | 0.048 | 0.128 | 0.2639 |
+
+Per-domain strict (DeBERTa / EuroBERT): L-CHAT 0.714/0.146, L-DIALOG 0.280/0.073,
+S-AUTO 0.232/0.064, S-BANK 0.281/0.139, S-DELIVERY 0.394/0.048, S-HR 0.366/0.128,
+S-RE 0.255/0.069, S-SUPPORT 0.390/0.071, S-TELECOM 0.214/0.052.
+
+Key finding: on RUSSIAN PII both neural models (trained on English/EU PIIBench) underperform
+rule-based Presidio; EuroBERT-610m is worst because it was never fine-tuned on Russian.
+Format-based PII (phone/email/card) is captured by Presidio's language-agnostic regexes.
+Reproduce: `eval_nervaluate.py [split] [max_docs]`.
