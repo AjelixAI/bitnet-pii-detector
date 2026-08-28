@@ -35,3 +35,21 @@
   --warmup-ratio 0.1 --weight-decay 0.1 --epochs 3 --max-steps 37500`
 - Eval: `run_streaming_model_benchmark.py --test-file ./data/test.jsonl
   --model-path ./models/best_model --chunk-size 5000 --batch-size 16`
+
+## Per-EU-language comparison (PIIBench, type-agnostic span-overlap F1)
+Evaluation on ai4privacy EU-language test rows (de/fr/it/es/nl), 800 rows/lang (~40% of EU test),
+gold spans on the mBERT grid; systems run with the same alignment + seqeval span-overlap metric.
+
+| lang | Presidio | DeBERTa-base | EuroBERT-610m |
+|---|---|---|---|
+| de | 0.337 | 0.534 | **0.610** |
+| fr | 0.408 | 0.556 | **0.641** |
+| it | 0.345 | 0.521 | **0.592** |
+| es | 0.348 | 0.495 | **0.531** |
+| nl | 0.351 | 0.489 | **0.543** |
+| macro | 0.358 | 0.519 | **0.584** |
+
+EuroBERT-610m is best on all 5 EU languages (+0.065 macro over DeBERTa-base, +0.226 over Presidio).
+Note: exact token-run F1 is lower for EuroBERT (0.172 vs DeBERTa 0.255) due to tokenizer boundary
+differences on the mBERT grid; overlap is the correct cross-system detection metric.
+Reproduce: `eval_eu_multilingual.py [max_rows_per_lang]` on the PIIBench server.
