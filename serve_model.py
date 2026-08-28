@@ -81,12 +81,18 @@ import re as _re
 # Well-defined formats: anchor each predicted span to the full regex match it sits in.
 FORMAT_RE = {
     "EMAIL": _re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),
-    "IBAN": _re.compile(r"\b[A-Z]{2}[0-9]{2}(?:[ ]?[0-9]{1,4}){3,9}\b"),
-    "BANK_CARD_NUMBER": _re.compile(r"\b(?:\d[ \-]?){12,19}\b"),
-    "CREDIT_CARD": _re.compile(r"\b(?:\d[ \-]?){12,19}\b"),
-    "CREDIT_DEBIT_CARD": _re.compile(r"\b(?:\d[ \-]?){12,19}\b"),
-    "PHONE_NUMBER": _re.compile(r"(?:\+\d{1,4}[\s\-]?)?(?:\(\d{1,5}\)[\s\-]?)?\d[\d\s().\-]{4,}\d"),
-    "PHONE": _re.compile(r"(?:\+\d{1,4}[\s\-]?)?(?:\(\d{1,5}\)[\s\-]?)?\d[\d\s().\-]{4,}\d"),
+    # IBAN: must be a real EU/EEA code + full length, not just "2 letters + digits"
+    "IBAN": _re.compile(r"\b(?:ES|DE|FR|IT|NL|BE|PT|AT|PL|GB|LU|IE|DK|SE|FI|NO|GR|CH|CY|MT|SK|SI|CZ|EE|LV|LT|HU|RO|BG|HR|LI|IS|MC|AD|SM)[0-9]{2}(?:[ ]?[0-9]{1,4}){4,9}\b"),
+    "PASSPORT_NUMBER": _re.compile(r"\b[A-Z]{2}[0-9]{6,7}\b"),
+    "TAX_ID": _re.compile(r"\b[0-9]{8}[-\s]?[A-Z]\b"),
+    "SSN": _re.compile(r"\b[0-9]{2}/[0-9]{8,11}\b"),
+    "BANK_CARD_NUMBER": _re.compile(r"\b(?:[0-9]{4}[ \-]?){3}[0-9]{4}\b"),
+    "CREDIT_CARD": _re.compile(r"\b(?:[0-9]{4}[ \-]?){3}[0-9]{4}\b"),
+    "CREDIT_DEBIT_CARD": _re.compile(r"\b(?:[0-9]{4}[ \-]?){3}[0-9]{4}\b"),
+    # phone must carry a country code (+/00) or a bracketed area code, or have space/hyphen
+    # group separators -- excludes pure digits (IDs) and dot-separated numbers (dates).
+    "PHONE_NUMBER": _re.compile(r"(?:(?:\+|00)\d{1,4}[\s\-]?)?(?:\(\d{1,5}\)[\s\-]?)?(?:\d{1,4}[\s\-]){1,5}\d{1,4}"),
+    "PHONE": _re.compile(r"(?:(?:\+|00)\d{1,4}[\s\-]?)?(?:\(\d{1,5}\)[\s\-]?)?(?:\d{1,4}[\s\-]){1,5}\d{1,4}"),
     "BIC": _re.compile(r"\b[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b"),
     "SWIFT_BIC": _re.compile(r"\b[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b"),
     "IPV4": _re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"),
@@ -135,10 +141,51 @@ def merge_spans(spans, text):
     return out
 
 
-# Higher precedence first: a region claimed by one format type can't be re-typed by a
-# lower-precedence one (e.g. phone must not swallow IBAN/card digit sequences).
-FORMAT_PRECEDENCE = ["IBAN", "BANK_CARD_NUMBER", "CREDIT_CARD", "CREDIT_DEBIT_CARD",
-                     "EMAIL", "IPV4", "URL", "BIC", "SWIFT_BIC", "PHONE_NUMBER", "PHONE"]
+# Unambiguous format types: regex is authoritative (can add + re-type).
+# Numeric-ambiguous types (phone/card/ID/date) stay MODEL-authoritative -- the model
+# disambiguates; regex only *extends* a phone/card span the model already predicted.
+FORMAT_PRECEDENCE = ["PASSPORT_NUMBER", "TAX_ID", "SSN", "IBAN",
+                     "BANK_CARD_NUMBER", "CREDIT_CARD", "CREDIT_DEBIT_CARD",
+                     "EMAIL", "IPV4", "URL", "BIC", "SWIFT_BIC"]
+NUMERIC_TYPES = {"PHONE_NUMBER", "PHONE", "BANK_CARD_NUMBER", "CREDIT_CARD",
+                 "CREDIT_DEBIT_CARD", "TAX_ID", "SSN", "BANK_ROUTING_NUMBER"}
+
+
+DATE_RE = _re.compile(r"\b[0-9]{1,2}[/\-\.][0-9]{1,2}[/\-\.][0-9]{2,4}\b")
+
+
+def expand_dates(spans, text):
+    """Complete a partially-predicted DATE/DATE_OF_BIRTH span to the full date string."""
+    for sp in spans:
+        if sp["type"] in ("DATE", "DATE_OF_BIRTH", "DATE_TIME"):
+            for m in DATE_RE.finditer(text):
+                if m.start() <= sp["end"] and m.end() >= sp["start"]:
+                    if m.end() - m.start() > sp["end"] - sp["start"]:
+                        sp["start"], sp["end"], sp["text"] = m.start(), m.end(), m.group()
+                    break
+    return spans
+
+
+def extend_numeric(spans, text):
+    """Grow a model-predicted numeric span over adjacent digits / common separators,
+    so a partial phone ('+371 2912') becomes the full number, without inventing new ones."""
+    out = []
+    for sp in sorted(spans, key=lambda x: x["start"]):
+        if sp["type"] in NUMERIC_TYPES:
+            s, e = sp["start"], sp["end"]
+            while e < len(text) and (text[e].isdigit() or text[e] in " +()-"):
+                e += 1
+            while s > 0 and (text[s - 1].isdigit() or text[s - 1] in "+() -"):
+                s -= 1
+            # trim leading/trailing whitespace
+            while s < e and text[s].isspace():
+                s += 1
+            while e > s and text[e - 1].isspace():
+                e -= 1
+            if e > s:
+                sp["start"], sp["end"], sp["text"] = s, e, text[s:e]
+        out.append(sp)
+    return out
 
 
 def format_pass(spans, text):
@@ -218,7 +265,7 @@ def extract(text):
             cb -= 1
         if cb > ca:
             conv.append({"type": t, "start": ca, "end": cb, "text": text[ca:cb], "score": round(sc, 4)})
-    return dedupe(format_pass(merge_spans(conv, text), text))
+    return dedupe(extend_numeric(expand_dates(format_pass(merge_spans(conv, text), text), text), text))
 
 
 app = FastAPI(title="AjelixAI PII Detector — EuroBERT-610m")
